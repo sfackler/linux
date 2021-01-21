@@ -181,6 +181,12 @@ struct mem_info *sample__resolve_mem(struct perf_sample *sample,
 
 struct callchain_cursor;
 
+int thread__resolve_callchain_unwind(struct thread *thread,
+				     struct callchain_cursor *cursor,
+				     struct evsel *evsel,
+				     struct perf_sample *sample,
+				     int max_stack);
+
 int thread__resolve_callchain(struct thread *thread,
 			      struct callchain_cursor *cursor,
 			      struct evsel *evsel,

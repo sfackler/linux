@@ -34,6 +34,9 @@
 #include <errno.h>
 #include <signal.h>
 
+#define DWARF_CALLGRAPH_EXTRA_TYPES (PERF_SAMPLE_REGS_USER | \
+	PERF_SAMPLE_STACK_USER | PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC)
+
 struct perf_inject {
 	struct perf_tool	tool;
 	struct perf_session	*session;
@@ -43,6 +46,7 @@ struct perf_inject {
 	bool			have_auxtrace;
 	bool			strip;
 	bool			jit_mode;
+	bool			resolve_callchains;
 	const char		*input_name;
 	struct perf_data	output;
 	u64			bytes_written;
@@ -490,6 +494,18 @@ static int perf_event__repipe_namespaces(struct perf_tool *tool,
 	return err;
 }
 
+static int perf_event__repipe_cgroup(struct perf_tool *tool,
+				     union perf_event *event,
+				     struct perf_sample *sample,
+				     struct machine *machine)
+{
+	int err = perf_event__process_cgroup(tool, event, sample, machine);
+
+	perf_event__repipe(tool, event, sample, machine);
+
+	return err;
+}
+
 static int perf_event__repipe_exit(struct perf_tool *tool,
 				   union perf_event *event,
 				   struct perf_sample *sample,
@@ -657,6 +673,94 @@ found:
 	return perf_event__repipe(tool, event_sw, &sample_sw, machine);
 }
 
+static int perf_inject__update_callchain(struct perf_sample *sample,
+					 struct ip_callchain *new_callchain,
+					 u64 callchain_capacity,
+					 struct evsel *evsel,
+					 struct addr_location *al)
+{
+	int out = 0;
+
+	if (sample->callchain->nr + 1 >= callchain_capacity)
+		return 0;
+
+	new_callchain->nr = sample->callchain->nr;
+	memcpy(&new_callchain->ips, &sample->callchain->ips,
+	       sample->callchain->nr * sizeof(u64));
+	sample->callchain = new_callchain;
+
+	sample->callchain->ips[sample->callchain->nr] = PERF_CONTEXT_USER;
+	sample->callchain->nr++;
+
+	callchain_cursor_reset(&callchain_cursor);
+	out = thread__resolve_callchain_unwind(al->thread, &callchain_cursor, evsel, sample,
+					       callchain_capacity - sample->callchain->nr);
+	if (out) {
+		pr_err("Failed to resolve callchain. Skipping\n");
+		return out;
+	}
+	callchain_cursor_commit(&callchain_cursor);
+
+	while (1) {
+		struct callchain_cursor_node *node;
+
+		node = callchain_cursor_current(&callchain_cursor);
+		if (!node)
+			break;
+
+		sample->callchain->ips[sample->callchain->nr] = node->ip;
+		sample->callchain->nr++;
+
+		callchain_cursor_advance(&callchain_cursor);
+	}
+
+	return 0;
+}
+
+static int perf_inject__resolve_callchain(struct perf_tool *tool,
+					  union perf_event *event,
+					  struct perf_sample *sample,
+					  struct evsel *evsel,
+					  struct machine *machine)
+{
+	struct addr_location al;
+	u64 callchain_buf[PERF_MAX_STACK_DEPTH + 1], sample_type;
+	struct ip_callchain *new_callchain = (struct ip_callchain *) &callchain_buf;
+	struct perf_inject *inject = container_of(tool, struct perf_inject, tool);
+	union perf_event *out_event = (union perf_event *) inject->event_copy;
+	int out = 0;
+
+	if (machine__resolve(machine, &al, sample) < 0) {
+		pr_err("problem processing %d event, skipping it.\n",
+		       event->header.type);
+		return -1;
+	}
+
+	if (al.filtered)
+		goto out_put;
+
+	out = perf_inject__update_callchain(sample, new_callchain,
+					    PERF_MAX_STACK_DEPTH, evsel, &al);
+	if (out)
+		goto out_put;
+
+	sample_type = evsel->core.attr.sample_type & ~DWARF_CALLGRAPH_EXTRA_TYPES;
+
+	out_event->header.type = event->header.type;
+	out_event->header.misc = event->header.misc;
+	out_event->header.size =
+		perf_event__sample_event_size(sample, sample_type,
+					      evsel->core.attr.read_format);
+	perf_event__synthesize_sample(out_event, sample_type,
+				      evsel->core.attr.read_format, sample);
+	build_id__mark_dso_hit(tool, out_event, sample, evsel, machine);
+	out = perf_event__repipe(tool, out_event, sample, machine);
+
+out_put:
+	addr_location__put(&al);
+	return out;
+}
+
 static void sig_handler(int sig __maybe_unused)
 {
 	session_done = 1;
@@ -707,7 +811,8 @@ static int __cmd_inject(struct perf_inject *inject)
 	signal(SIGINT, sig_handler);
 
 	if (inject->build_ids || inject->sched_stat ||
-	    inject->itrace_synth_opts.set || inject->build_id_all) {
+	    inject->itrace_synth_opts.set || inject->build_id_all ||
+		inject->resolve_callchains) {
 		inject->tool.mmap	  = perf_event__repipe_mmap;
 		inject->tool.mmap2	  = perf_event__repipe_mmap2;
 		inject->tool.fork	  = perf_event__repipe_fork;
@@ -754,6 +859,27 @@ static int __cmd_inject(struct perf_inject *inject)
 		output_data_offset = 4096;
 		if (inject->strip)
 			strip_init(inject);
+	} else if (inject->resolve_callchains) {
+		struct evsel *evsel;
+
+		inject->tool.comm = perf_event__repipe_comm;
+		inject->tool.namespaces = perf_event__repipe_namespaces;
+		inject->tool.cgroup = perf_event__repipe_cgroup;
+		inject->tool.exit = perf_event__repipe_exit;
+
+		symbol_conf.use_callchain = true;
+		symbol_conf.inline_name = false;
+		symbol_conf.hide_unresolved = false;
+		callchain_param.record_mode = CALLCHAIN_DWARF;
+		dwarf_callchain_users = true;
+
+		evlist__for_each_entry(session->evlist, evsel) {
+			if ((evsel->core.attr.sample_type &
+			     (DWARF_CALLGRAPH_EXTRA_TYPES | PERF_SAMPLE_CALLCHAIN)) ==
+			    (DWARF_CALLGRAPH_EXTRA_TYPES | PERF_SAMPLE_CALLCHAIN)) {
+				evsel->handler = perf_inject__resolve_callchain;
+			}
+		}
 	}
 
 	if (!inject->itrace_synth_opts.set)
@@ -788,6 +914,16 @@ static int __cmd_inject(struct perf_inject *inject)
 			    inject->itrace_synth_opts.add_last_branch)
 				perf_header__set_feat(&session->header,
 						      HEADER_BRANCH_STACK);
+		} else if (inject->resolve_callchains) {
+			struct evsel *evsel;
+
+			evlist__for_each_entry(session->evlist, evsel) {
+				if (evsel->handler ==
+				    perf_inject__resolve_callchain) {
+					evsel->core.attr.sample_type &=
+						~DWARF_CALLGRAPH_EXTRA_TYPES;
+				}
+			}
 		}
 		session->header.data_offset = output_data_offset;
 		session->header.data_size = inject->bytes_written;
@@ -878,6 +1014,8 @@ int cmd_inject(int argc, const char **argv)
 				    itrace_parse_synth_opts),
 		OPT_BOOLEAN(0, "strip", &inject.strip,
 			    "strip non-synthesized events (use with --itrace)"),
+		OPT_BOOLEAN(0, "resolve-callchains", &inject.resolve_callchains,
+				"resolve dwarf call-graph information into callchains"),
 		OPT_END()
 	};
 	const char * const inject_usage[] = {
@@ -926,6 +1064,11 @@ int cmd_inject(int argc, const char **argv)
 
 	if (inject.sched_stat) {
 		inject.tool.ordered_events = true;
+	}
+
+	if (inject.resolve_callchains) {
+		inject.tool.ordered_events = true;
+		inject.tool.ordering_requires_timestamps = true;
 	}
 
 #ifdef HAVE_JITDUMP

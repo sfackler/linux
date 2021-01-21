@@ -2871,11 +2871,11 @@ static int unwind_entry(struct unwind_entry *entry, void *arg)
 				       false, NULL, 0, 0, 0, srcline);
 }
 
-static int thread__resolve_callchain_unwind(struct thread *thread,
-					    struct callchain_cursor *cursor,
-					    struct evsel *evsel,
-					    struct perf_sample *sample,
-					    int max_stack)
+int thread__resolve_callchain_unwind(struct thread *thread,
+				     struct callchain_cursor *cursor,
+				     struct evsel *evsel,
+				     struct perf_sample *sample,
+				     int max_stack)
 {
 	/* Can we do dwarf post unwind? */
 	if (!((evsel->core.attr.sample_type & PERF_SAMPLE_REGS_USER) &&
